@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Hardened the isolated stress-test harness: every run now uses an owned leaf
+  under Python's system temporary directory, validates cleanup targets without
+  following links, and verifies both the test root and a controlled sibling
+  canary after every test. Fuzz cleanup retries briefly on transient Windows
+  locks and reports the seed, iteration, trace, residuals, and original error
+  instead of silently ignoring a failed teardown.
+- Bounded CI stress verification with deterministic L1/L2/L4 profiles and a
+  540-second internal deadline. Long-run rounds now emit timing/resource
+  metrics and clean their own artifacts immediately, preventing accumulation
+  from masking a timeout or leak.
+
+### Testing
+
+- Windows CI now requires an actual junction or symbolic-link cycle scan and
+  records a structured coverage status; local hosts without link privileges
+  still skip that one scenario explicitly. The stress workflow remains
+  separate from the 3-platform functional matrix, but is a merge gate for
+  this repository.
+
 ## [v2.1.2] - 2026-08-04
 
 Patch release fixing an empty-dirs classification defect found by the CD-drive
