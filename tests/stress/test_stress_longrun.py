@@ -57,11 +57,16 @@ import pytest
 
 from scripts import cleaner, scanner
 
-# 2 warm-up rounds (scan+clean, no measurement) then 10 measured rounds.
-_WARM_UP_ROUNDS = 2
-_MEASURED_ROUNDS = 10
-_START_FILES = 5000
-_FILES_PER_ROUND = 500
+# L2 has two deliberately fixed profiles.  CI is intentionally small enough
+# to leave headroom inside its 150-second in-process budget; ``local`` keeps
+# the original deep soak workload.  Do not add numeric environment overrides:
+# reproducible profiles are the point of this regression test.
+_L2_PROFILES = {
+    "ci": {"warm_up": 2, "measured": 5, "start_files": 100, "file_increment": 25},
+    "local": {"warm_up": 2, "measured": 10, "start_files": 5000, "file_increment": 500},
+}
+_L2_TOTAL_BUDGET_SECONDS = 150.0
+_L2_CI_PER_ROUND_BUDGET_SECONDS = 15.0
 
 # Junk files are aged 10 days so they pass the scanner's 7-day cutoff and the
 # cleaner's delete-time temp-age recheck (a fresh file would be skipped).
@@ -99,6 +104,43 @@ def _snapshot() -> tuple[int, int]:
     """Return (rss_bytes, open_handles) for the current process."""
     rss = int(psutil.Process().memory_info().rss)
     return rss, _open_handle_count()
+
+
+def _l2_profile() -> tuple[str, dict[str, int]]:
+    """Return the fixed L2 profile, rejecting ambiguous CI configuration."""
+    name = os.environ.get("STRESS_L2_PROFILE", "local").strip().lower()
+    if name not in _L2_PROFILES:
+        raise ValueError(
+            "STRESS_L2_PROFILE must be exactly 'ci' or 'local', "
+            f"not {name!r}"
+        )
+    return name, _L2_PROFILES[name]
+
+
+def _remove_round_audited(round_dir: Path) -> None:
+    """Remove one owned round and fail loudly if any entry remains.
+
+    ``round_dir`` is always an immediate child created by this test beneath
+    ``rounds_dir``.  ``shutil.rmtree(ignore_errors=True)`` used to hide a
+    failed teardown and leave the next round to inherit stale artefacts.
+    """
+    if not round_dir.exists():
+        return
+    errors: list[str] = []
+
+    def onerror(operation, path, excinfo) -> None:
+        error = excinfo[1]
+        errors.append(
+            f"{getattr(operation, '__name__', operation)}({path}): "
+            f"{type(error).__name__}: {error}"
+        )
+
+    shutil.rmtree(round_dir, onerror=onerror)
+    if round_dir.exists():
+        residuals = sorted(str(path.relative_to(round_dir)) for path in round_dir.rglob("*"))
+        errors.append("residuals=" + repr(residuals))
+    if errors:
+        raise AssertionError("round teardown failed: " + "; ".join(errors))
 
 
 def _aged_file(path: Path, days_old: int) -> Path:
@@ -166,93 +208,113 @@ def _no_running_processes():
 
 @pytest.mark.stress
 def test_ten_rounds_no_leak(stress_root):
-    """10 measured scan+clean rounds on a growing tree: RSS and handles stable."""
+    """Fixed-profile scan+clean rounds: resources stable and teardown audited."""
+    profile_name, profile = _l2_profile()
     integration = stress_root / "integration"
     rounds_dir = integration / "leak-rounds"
     rounds_dir.mkdir(parents=True, exist_ok=True)
-    total_rounds = _WARM_UP_ROUNDS + _MEASURED_ROUNDS
+    total_rounds = profile["warm_up"] + profile["measured"]
     baseline_rss: Optional[int] = None
     baseline_handles: Optional[int] = None
     rss_peaks: list[int] = []
     handle_peaks: list[int] = []
+    suite_start = time.monotonic()
     try:
         for round_no in range(1, total_rounds + 1):
-            measured = round_no > _WARM_UP_ROUNDS
-            file_count = _START_FILES + (round_no - 1) * _FILES_PER_ROUND
+            round_start = time.monotonic()
+            measured = round_no > profile["warm_up"]
+            file_count = profile["start_files"] + (round_no - 1) * profile["file_increment"]
             round_dir = rounds_dir / f"round-{round_no:03d}"
-            tree = round_dir / "tree"
-            cache = _build_tree(tree, file_count)
+            build_seconds = scan_seconds = clean_seconds = verify_seconds = 0.0
+            rss_before = handles_before = rss_after = handles_after = 0
+            try:
+                build_start = time.monotonic()
+                tree = round_dir / "tree"
+                cache = _build_tree(tree, file_count)
+                build_seconds = time.monotonic() - build_start
 
-            gc.collect()
-            rss_before, handles_before = _snapshot()
+                gc.collect()
+                rss_before, handles_before = _snapshot()
+                scan_start = time.monotonic()
+                with _no_running_processes():
+                    run_dir = round_dir / "out"
+                    scan_result = scanner.scan(
+                        "X:", root_path=tree, out_dir=run_dir,
+                        categories=["browser-caches"], local_app_data=tree,
+                        user_cache_dir=tree, is_user_drive=True,
+                    )
+                    scan_seconds = time.monotonic() - scan_start
+                    clean_start = time.monotonic()
+                    candidates_csv = Path(scan_result["run_dir"]) / "candidates.csv"
+                    clean_result = cleaner.clean(
+                        "X:", volume=_volume(round_dir), candidates_csv=candidates_csv,
+                        yes=True, quarantine_dir=round_dir / "quarantine",
+                        allow_posix_unlink=True, is_user_drive=True,
+                        is_system_drive=False,
+                    )
+                    clean_seconds = time.monotonic() - clean_start
+                verify_start = time.monotonic()
+                gc.collect()
+                rss_after, handles_after = _snapshot()
 
-            with _no_running_processes():
-                run_dir = round_dir / "out"
-                scan_result = scanner.scan(
-                    "X:",
-                    root_path=tree,
-                    out_dir=run_dir,
-                    categories=["browser-caches"],
-                    local_app_data=tree,
-                    user_cache_dir=tree,
-                    is_user_drive=True,
+                # Real work sanity: a no-op round is not leak coverage.
+                assert scan_result["rows"], f"round {round_no}: scanner found no browser-caches candidate"
+                assert cache.is_dir(), f"round {round_no}: clean_contents must keep the cache dir"
+                survivors = [Path(root) / name for root, _dirs, names in os.walk(cache) for name in names]
+                assert not survivors, f"round {round_no}: {len(survivors)} junk files survived cleanup"
+                assert clean_result["dispositions"], f"round {round_no}: cleaner recorded no dispositions"
+                verify_seconds = time.monotonic() - verify_start
+
+                if not measured:
+                    baseline_rss, baseline_handles = rss_after, handles_after
+                else:
+                    assert baseline_rss is not None and baseline_handles is not None
+                    rss_peaks.append(rss_after)
+                    handle_peaks.append(handles_after)
+                    assert rss_after <= baseline_rss * (1 + _RSS_GROWTH_LIMIT), (
+                        f"round {round_no}: RSS grew to {rss_after} bytes vs baseline "
+                        f"{baseline_rss} (> {_RSS_GROWTH_LIMIT:.0%})"
+                    )
+                    for label, value in (("before", handles_before), ("after", handles_after)):
+                        assert abs(value - baseline_handles) <= _FD_DELTA_LIMIT, (
+                            f"round {round_no}: handle count {label}={value} drifted from "
+                            f"baseline {baseline_handles} by more than {_FD_DELTA_LIMIT}"
+                        )
+            finally:
+                teardown_start = time.monotonic()
+                _remove_round_audited(round_dir)
+                teardown_seconds = time.monotonic() - teardown_start
+                round_total = time.monotonic() - round_start
+                print(
+                    "L2_ROUND_METRICS "
+                    f"profile={profile_name} round={round_no} files={file_count} "
+                    f"build={build_seconds:.3f}s scan={scan_seconds:.3f}s "
+                    f"clean={clean_seconds:.3f}s verify={verify_seconds:.3f}s "
+                    f"teardown={teardown_seconds:.3f}s total={round_total:.3f}s "
+                    f"rss_before={rss_before} rss_after={rss_after} "
+                    f"handles_before={handles_before} handles_after={handles_after}"
                 )
-                candidates_csv = Path(scan_result["run_dir"]) / "candidates.csv"
-                clean_result = cleaner.clean(
-                    "X:",
-                    volume=_volume(round_dir),
-                    candidates_csv=candidates_csv,
-                    yes=True,
-                    quarantine_dir=round_dir / "quarantine",
-                    allow_posix_unlink=True,
-                    is_user_drive=True,
-                    is_system_drive=False,
-                )
-            gc.collect()
-            rss_after, handles_after = _snapshot()
-
-            # Real work sanity: the round must have found the cache candidate
-            # and actually cleaned it (a vacuous no-op round proves nothing).
-            assert scan_result["rows"], f"round {round_no}: scanner found no browser-caches candidate"
-            assert cache.is_dir(), f"round {round_no}: clean_contents must keep the cache dir"
-            # Iterative file listing (os.walk) — pathlib.rglob delegates per-level
-            # via C-level recursive yield-from and can RecursionError on deep
-            # trees; os.walk is iterative and never recurses into symlinks.
-            survivors = [
-                Path(root) / name
-                for root, _dirs, names in os.walk(cache)
-                for name in names
-            ]
-            assert not survivors, f"round {round_no}: {len(survivors)} junk files survived cleanup"
-            assert clean_result["dispositions"], f"round {round_no}: cleaner recorded no dispositions"
-
-            if not measured:
-                baseline_rss, baseline_handles = rss_after, handles_after
-                continue
-            assert baseline_rss is not None and baseline_handles is not None
-            rss_peaks.append(rss_after)
-            handle_peaks.append(handles_after)
-            assert rss_after <= baseline_rss * (1 + _RSS_GROWTH_LIMIT), (
-                f"round {round_no}: RSS grew to {rss_after} bytes vs baseline "
-                f"{baseline_rss} (> {_RSS_GROWTH_LIMIT:.0%})"
-            )
-            for label, value in (("before", handles_before), ("after", handles_after)):
-                assert abs(value - baseline_handles) <= _FD_DELTA_LIMIT, (
-                    f"round {round_no}: handle count {label}={value} drifted from "
-                    f"baseline {baseline_handles} by more than {_FD_DELTA_LIMIT}"
+                if profile_name == "ci":
+                    assert round_total <= _L2_CI_PER_ROUND_BUDGET_SECONDS, (
+                        f"round {round_no}: {round_total:.3f}s exceeds fixed CI "
+                        f"per-round budget {_L2_CI_PER_ROUND_BUDGET_SECONDS:.0f}s"
+                    )
+                assert time.monotonic() - suite_start <= _L2_TOTAL_BUDGET_SECONDS, (
+                    f"L2 profile {profile_name} exceeded its fixed "
+                    f"{_L2_TOTAL_BUDGET_SECONDS:.0f}s budget"
                 )
 
         assert baseline_rss is not None
         assert max(rss_peaks) <= baseline_rss * (1 + _RSS_GROWTH_LIMIT), (
-            f"RSS leaked over {_MEASURED_ROUNDS} rounds: peak {max(rss_peaks)} "
+            f"RSS leaked over {profile['measured']} rounds: peak {max(rss_peaks)} "
             f"vs baseline {baseline_rss}"
         )
         assert max(abs(value - baseline_handles) for value in handle_peaks) <= _FD_DELTA_LIMIT, (
-            f"open-handle count leaked over {_MEASURED_ROUNDS} rounds"
+            f"open-handle count leaked over {profile['measured']} rounds"
         )
     finally:
-        # MUST clean up before the assert_no_escape after-snapshot runs.
-        shutil.rmtree(rounds_dir, ignore_errors=True)
+        if rounds_dir.exists():
+            _remove_round_audited(rounds_dir)
 
 
 @pytest.mark.stress
@@ -261,57 +323,35 @@ def test_rounds_with_running_app(stress_root):
     integration = stress_root / "integration"
     rounds_dir = integration / "gate-rounds"
     rounds_dir.mkdir(parents=True, exist_ok=True)
+    profile_name, profile = _l2_profile()
+    gate_rounds = 3 if profile_name == "ci" else _GATE_ROUNDS
+    suite_start = time.monotonic()
     try:
-        for round_no in range(1, _GATE_ROUNDS + 1):
+        for round_no in range(1, gate_rounds + 1):
             round_dir = rounds_dir / f"gate-{round_no:03d}"
-            cache = round_dir / "cache"
-            cache.mkdir(parents=True, exist_ok=True)
-            files = [_aged_file(cache / f"blob-{index}.tmp", _AGED_DAYS) for index in range(3)]
-            candidates = round_dir / "candidates.csv"
-            _write_candidates(
-                candidates,
-                [
-                    {
-                        "Category": "browser-caches",
-                        "Risk": "SAFE",
-                        "Path": str(cache),
-                        "SizeBytes": sum(path.stat().st_size for path in files),
-                        "FileCount": len(files),
-                        "Action": "delete",
-                    }
-                ],
-            )
-
-            buffer = io.StringIO()
-            with _mock_running(cleaner, ["chrome.exe"]):
-                with contextlib.redirect_stdout(buffer):
-                    result = cleaner.clean(
-                        "X:",
-                        volume=_volume(round_dir),
-                        candidates_csv=candidates,
-                        yes=True,
-                        quarantine_dir=round_dir / "quarantine",
-                        is_user_drive=True,
-                        is_system_drive=False,
-                    )
-            out = buffer.getvalue()
-
-            assert all(path.exists() for path in files), (
-                f"round {round_no}: FM4 gate must preserve running-app cache files"
-            )
-            assert cache.exists(), f"round {round_no}: gated cache dir must survive"
-            assert result["dispositions"] == [], (
-                f"round {round_no}: gated category must not delete anything"
-            )
-            assert "browser-caches" in result["skipped_categories"], (
-                f"round {round_no}: browser-caches must be listed as skipped"
-            )
-            assert "检测到 Chrome 运行中" in out, (
-                f"round {round_no}: FM4 skip message must name the running app"
-            )
-            assert "浏览器缓存清理已跳过" in out, (
-                f"round {round_no}: FM4 skip message must name the category"
-            )
+            round_start = time.monotonic()
+            try:
+                cache = round_dir / "cache"
+                cache.mkdir(parents=True, exist_ok=True)
+                files = [_aged_file(cache / f"blob-{index}.tmp", _AGED_DAYS) for index in range(3)]
+                candidates = round_dir / "candidates.csv"
+                _write_candidates(candidates, [{"Category": "browser-caches", "Risk": "SAFE", "Path": str(cache), "SizeBytes": sum(path.stat().st_size for path in files), "FileCount": len(files), "Action": "delete"}])
+                buffer = io.StringIO()
+                with _mock_running(cleaner, ["chrome.exe"]):
+                    with contextlib.redirect_stdout(buffer):
+                        result = cleaner.clean("X:", volume=_volume(round_dir), candidates_csv=candidates, yes=True, quarantine_dir=round_dir / "quarantine", is_user_drive=True, is_system_drive=False)
+                out = buffer.getvalue()
+                assert all(path.exists() for path in files), f"round {round_no}: FM4 gate must preserve running-app cache files"
+                assert cache.exists(), f"round {round_no}: gated cache dir must survive"
+                assert result["dispositions"] == [], f"round {round_no}: gated category must not delete anything"
+                assert "browser-caches" in result["skipped_categories"], f"round {round_no}: browser-caches must be listed as skipped"
+                assert "检测到 Chrome 运行中" in out, f"round {round_no}: FM4 skip message must name the running app"
+                assert "浏览器缓存清理已跳过" in out, f"round {round_no}: FM4 skip message must name the category"
+            finally:
+                _remove_round_audited(round_dir)
+                elapsed = time.monotonic() - round_start
+                print(f"L2_GATE_METRICS profile={profile_name} round={round_no} total={elapsed:.3f}s")
+                assert time.monotonic() - suite_start <= _L2_TOTAL_BUDGET_SECONDS, "L2 running-app gate exceeded 150s budget"
     finally:
-        # MUST clean up before the assert_no_escape after-snapshot runs.
-        shutil.rmtree(rounds_dir, ignore_errors=True)
+        if rounds_dir.exists():
+            _remove_round_audited(rounds_dir)
