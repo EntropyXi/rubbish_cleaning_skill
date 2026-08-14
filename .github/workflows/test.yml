@@ -193,19 +193,9 @@ jobs:
           print("REAL-APP CLEAN INTEGRATION: PASS")
           PY
 
-  # Informational stress job — deliberately SEPARATE from the 9-job `test`
-  # matrix above (which must stay untouched). Runs the slow L1/L2/L4 stress
-  # suites on 2 OS with a job-level timeout. It is NOT a required check and
-  # never gates routine CI: it only surfaces perf/leak/safety-fuzz trends.
-  #
-  # runs-on is a 2-entry matrix (ubuntu-latest, windows-latest) because a
-  # single `runs-on: [ubuntu-latest, windows-latest]` array uses AND semantics
-  # (a runner must match ALL labels) and could never be satisfied.
-  #
-  # RUBBISH_STRESS_ROOT: the fixture's local default is D:\_rubbish_cleaner_stress
-  # (Windows CI runners have NO D:), so the env override redirects the stress
-  # root to the runner's temp dir. FUZZ_ITERS caps the L4 fuzz worlds at 20
-  # for CI runtime (local default is 500).
+  # Bounded, required stress verification.  It remains separate from the
+  # 3-OS x 3-Python functional matrix because it exercises load-specific L1,
+  # L2 and L4 scenarios on Ubuntu and Windows.
   stress:
     name: stress (${{ matrix.os }})
     strategy:
@@ -214,8 +204,6 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
-    env:
-      FUZZ_ITERS: 20
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -231,11 +219,99 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
 
+      - name: Create isolated stress paths and fixed CI profile
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import stat
+          import tempfile
+          import uuid
+          from pathlib import Path
+
+          def assert_no_link_ancestor(path):
+              current = path
+              while True:
+                  info = os.lstat(current)
+                  attrs = getattr(info, "st_file_attributes", 0)
+                  reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                  if stat.S_ISLNK(info.st_mode) or attrs & reparse:
+                      raise RuntimeError("temporary path has a link ancestor: " + str(current))
+                  if current.parent == current:
+                      return
+                  current = current.parent
+
+          parent = Path(tempfile.gettempdir()).resolve()
+          assert_no_link_ancestor(parent)
+          token = uuid.uuid4().hex
+          root = parent / ("rubbish-stress-" + os.environ["GITHUB_RUN_ID"] + "-" + token)
+          status = parent / ("rubbish-stress-link-status-" + token + ".json")
+          if root.exists() or status.exists():
+              raise RuntimeError("stress paths must not exist before the fixture owns them")
+          values = {
+              "RUBBISH_STRESS_ROOT": root.as_posix(),
+              "RUBBISH_STRESS_STATUS_FILE": status.as_posix(),
+              "STRESS_L2_PROFILE": "ci",
+              "STRESS_100K_COUNT": "5000",
+              # Measured locally with seed 42: 12 worlds complete in about
+              # 106 seconds.  Twelve deterministic worlds retain meaningful
+              # scanner/cleaner coverage while keeping L4 inside its fixed
+              # 120-second slice of the 540-second suite envelope.
+              "FUZZ_ITERS": "12",
+              "FUZZ_PER_ITER_BUDGET_S": "15",
+              "FUZZ_TOTAL_BUDGET_S": "120",
+              "RUBBISH_STRESS_SUITE_BUDGET_S": "540",
+          }
+          if os.environ["RUNNER_OS"] == "Windows":
+              values["REQUIRE_WINDOWS_LINK_CYCLE"] = "1"
+          elif os.environ["RUNNER_OS"] == "Linux":
+              values["REQUIRE_POSIX_LINK_CYCLE"] = "1"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+              for key, value in values.items():
+                  stream.write(key + "=" + value + "\n")
+          PY
+
       - name: Run stress suite
         shell: bash
-        env:
-          # runner.temp is only resolvable at step level (not job-level env),
-          # and GitHub Actions Windows runners have no D:, so the stress root
-          # must be redirected to the runner's temp dir here.
-          RUBBISH_STRESS_ROOT: ${{ runner.temp }}\rubbish-stress
-        run: python -m pytest tests/stress/ -m stress -x --tb=short
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          budget = int(os.environ["RUBBISH_STRESS_SUITE_BUDGET_S"])
+          try:
+              completed = subprocess.run(
+                  [sys.executable, "-m", "pytest", "tests/stress/", "-m", "stress", "-x", "--tb=short", "-vv"],
+                  timeout=budget,
+              )
+          except subprocess.TimeoutExpired:
+              raise SystemExit("stress suite exceeded fixed internal %ss deadline" % budget)
+          raise SystemExit(completed.returncode)
+          PY
+
+      - name: Assert required link-cycle coverage
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          path = Path(os.environ["RUBBISH_STRESS_STATUS_FILE"])
+          try:
+              payload = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as error:
+              raise SystemExit("link-cycle status missing or invalid: %s" % error)
+          required = {"status", "kind", "reason", "platform"}
+          if set(payload) != required:
+              raise SystemExit("link-cycle status schema mismatch: %r" % payload)
+          if payload["status"] != "executed" or payload["kind"] not in {"junction", "symlink"}:
+              raise SystemExit("required link cycle did not execute: %r" % payload)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
+              stream.write("## Stress link-cycle coverage\n\n```json\n")
+              stream.write(json.dumps(payload, sort_keys=True))
+              stream.write("\n```\n")
+          print("LINK_CYCLE_STATUS=" + json.dumps(payload, sort_keys=True))
+          PY

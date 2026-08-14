@@ -56,13 +56,13 @@ from __future__ import annotations
 import hashlib
 import os
 import random
-import shutil
 import time
 from pathlib import Path
 from typing import Any, Optional
 
 import pytest
 
+from . import conftest as stress_conftest
 from scripts import cleaner, scanner
 from scripts.lib import platform as lib_platform
 
@@ -84,6 +84,8 @@ MAX_BYTES = 5 * 1024 * 1024
 MAX_DEPTH = 20
 MAX_NAME_LEN = 200
 _MAX_PATH = 240 if IS_WINDOWS else 1024
+_CLEANUP_ATTEMPTS = 3
+_CLEANUP_RETRY_DELAY_S = 0.1
 
 # Mirrors the scanner's FM7 data-suffix set exactly (Oracle Finding 6).
 _DATA_SUFFIXES = scanner._DATA_SUFFIXES
@@ -157,6 +159,38 @@ def _fail(seed: int, iteration: int, op_trace: list[str], message: str) -> None:
         f"op_trace:\n{trace}\n"
         f"violation: {message}"
     )
+
+
+class FixtureCleanupError(RuntimeError):
+    """Deterministic, reproducible failure from the fuzz fixture teardown."""
+
+    def __init__(
+        self,
+        seed: int,
+        iteration: int,
+        op_trace: list[str],
+        attempts: list[str],
+        residuals: list[str],
+        *,
+        body_error: Optional[BaseException] = None,
+    ) -> None:
+        self.seed = seed
+        self.iteration = iteration
+        self.op_trace = list(op_trace)
+        self.attempts = list(attempts)
+        self.residuals = list(residuals)
+        self.body_error = body_error
+        trace = "\n".join(f"  op[{index}] {entry}" for index, entry in enumerate(op_trace))
+        attempt_text = "\n".join(f"  {entry}" for entry in attempts) or "  <none>"
+        residual_text = "\n".join(f"  {entry}" for entry in residuals) or "  <none>"
+        context = " while preserving a test-body failure" if body_error is not None else ""
+        super().__init__(
+            f"test-fixture residual{context}\n"
+            f"seed={seed} iteration={iteration}\n"
+            f"op_trace:\n{trace or '  <none>'}\n"
+            f"cleanup_attempts:\n{attempt_text}\n"
+            f"no_follow_residuals:\n{residual_text}"
+        )
 
 
 def _check_budget(
@@ -650,7 +684,9 @@ def _execute_op(
         op_trace.append(f"{kind}(categories=[], no-op)")
         return
 
-    allow_unlink = bool(rng.getrandbits(1))
+    # POSIX deletion coverage must be explicit: a randomized false value would
+    # only exercise the product's intentional SKIP_POSIX_UNSAFE default.
+    allow_unlink = True
     result = cleaner.clean(
         _DRIVE,
         volume=_volume(world),
@@ -774,6 +810,72 @@ def _check_postconditions(
                   f"(e) clean_contents removed its target dir: {target}")
 
 
+def _no_follow_residual(path: Path) -> str:
+    """Describe a residual without walking through a link or junction."""
+    if not os.path.lexists(os.fspath(path)):
+        return f"{path}|MISSING"
+    try:
+        info = os.lstat(os.fspath(path))
+    except OSError as error:
+        return f"{path}|LSTAT_ERROR|{type(error).__name__}|errno={error.errno}|winerror={getattr(error, 'winerror', None)}"
+    if os.path.islink(os.fspath(path)) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stress_conftest, "_REPARSE_POINT", 0x400)
+    ):
+        try:
+            return f"{path}|LINK|target={os.readlink(os.fspath(path))!r}"
+        except OSError as error:
+            return f"{path}|LINK_ERROR|{type(error).__name__}|errno={error.errno}|winerror={getattr(error, 'winerror', None)}"
+    if path.is_dir():
+        return f"{path}|DIR\n{stress_conftest._snapshot_no_follow(path)}"
+    return f"{path}|FILE|size={info.st_size}"
+
+
+def _cleanup_iteration(
+    fuzz_root: Path,
+    world: Path,
+    run_dir: Path,
+    quarantine_dir: Path,
+    seed: int,
+    iteration: int,
+    op_trace: list[str],
+) -> None:
+    """Delete the three owned iteration children with bounded diagnostics.
+
+    Every attempt re-validates lexical direct-child ownership and no-follow
+    ancestors in ``cleanup_owned_direct_child``.  It intentionally never
+    deletes ``fuzz_root`` or a parent and never suppresses a residual.
+    """
+    targets = (
+        (world, f"{iteration:04d}"),
+        (run_dir, f"run-{iteration:04d}"),
+        (quarantine_dir, f"quarantine-{iteration:04d}"),
+    )
+    attempts: list[str] = []
+    residuals: list[str] = []
+    for target, expected_name in targets:
+        for attempt in range(1, _CLEANUP_ATTEMPTS + 1):
+            try:
+                stress_conftest.cleanup_owned_direct_child(
+                    fuzz_root, target, expected_name
+                )
+                attempts.append(f"target={target} attempt={attempt} result=ok")
+            except Exception as error:
+                attempts.append(
+                    f"target={target} attempt={attempt} error={type(error).__name__} "
+                    f"errno={getattr(error, 'errno', None)} "
+                    f"winerror={getattr(error, 'winerror', None)} detail={error}"
+                )
+            if not os.path.lexists(os.fspath(target)):
+                break
+            residuals.append(_no_follow_residual(target))
+            if attempt < _CLEANUP_ATTEMPTS:
+                time.sleep(_CLEANUP_RETRY_DELAY_S)
+        if os.path.lexists(os.fspath(target)):
+            residuals.append(f"FINAL|{_no_follow_residual(target)}")
+    if residuals and any(entry.startswith("FINAL|") for entry in residuals):
+        raise FixtureCleanupError(seed, iteration, op_trace, attempts, residuals)
+
+
 @pytest.mark.stress
 def test_fuzz_safety_invariants_hold(stress_root):
     """Deterministic safety fuzz: N random worlds x random ops, 6 invariants."""
@@ -834,8 +936,125 @@ def test_fuzz_safety_invariants_hold(stress_root):
             print(f"[fuzz] world {iteration:04d}/{iters} ok "
                   f"({n_ops} ops, {len(owned_stems)} owned-stem(s), "
                   f"{len(quarantined)} quarantine(s))")
-        finally:
-            # Cleanup per iteration — ALWAYS, even on violation.
-            shutil.rmtree(world, ignore_errors=True)
-            shutil.rmtree(run_dir, ignore_errors=True)
-            shutil.rmtree(quarantine_dir, ignore_errors=True)
+        except BaseException as body_error:
+            # Keep the original product/assertion failure as the causal chain,
+            # but never hide an independently failed fixture cleanup.
+            try:
+                _cleanup_iteration(
+                    fuzz_root, world, run_dir, quarantine_dir,
+                    seed, iteration, op_trace,
+                )
+            except FixtureCleanupError as cleanup_error:
+                raise FixtureCleanupError(
+                    seed, iteration, op_trace,
+                    cleanup_error.attempts, cleanup_error.residuals,
+                    body_error=body_error,
+                ) from body_error
+            raise
+        else:
+            _cleanup_iteration(
+                fuzz_root, world, run_dir, quarantine_dir,
+                seed, iteration, op_trace,
+            )
+
+
+def _regression_iteration_paths(stress_root: Path, iteration: int) -> tuple[Path, Path, Path, Path]:
+    fuzz_root = stress_root / "fuzz"
+    return (
+        fuzz_root,
+        fuzz_root / f"{iteration:04d}",
+        fuzz_root / f"run-{iteration:04d}",
+        fuzz_root / f"quarantine-{iteration:04d}",
+    )
+
+
+@pytest.mark.stress
+def test_fuzz_cleanup_removes_only_iteration_children(stress_root: Path) -> None:
+    """Regression: a normal iteration tree is removed with no root residual."""
+    fuzz_root, world, run_dir, quarantine_dir = _regression_iteration_paths(stress_root, 9101)
+    for target in (world, run_dir, quarantine_dir):
+        (target / "nested").mkdir(parents=True)
+        (target / "nested" / "payload.bin").write_bytes(b"payload")
+    _cleanup_iteration(fuzz_root, world, run_dir, quarantine_dir, 42, 9101, ["regression-normal"])
+    assert all(not os.path.lexists(os.fspath(path)) for path in (world, run_dir, quarantine_dir))
+
+
+@pytest.mark.stress
+def test_fuzz_cleanup_does_not_follow_link_target(stress_root: Path) -> None:
+    """Regression: a link iteration target is unlinked, never recursively walked."""
+    fuzz_root, world, run_dir, quarantine_dir = _regression_iteration_paths(stress_root, 9102)
+    outside_parent = stress_root / "unit"
+    outside = outside_parent / "fuzz-link-target"
+    outside.mkdir()
+    payload = outside / "must-survive.txt"
+    payload.write_text("outside", encoding="utf-8")
+    try:
+        try:
+            world.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            pytest.skip(f"cannot create stress link regression fixture: {error}")
+        run_dir.mkdir()
+        quarantine_dir.mkdir()
+        _cleanup_iteration(fuzz_root, world, run_dir, quarantine_dir, 42, 9102, ["regression-link"])
+        assert not os.path.lexists(os.fspath(world))
+        assert payload.read_text(encoding="utf-8") == "outside"
+    finally:
+        stress_conftest.cleanup_owned_direct_child(
+            outside_parent, outside, "fuzz-link-target"
+        )
+
+
+@pytest.mark.stress
+def test_fuzz_cleanup_reports_retries_and_residuals(
+    stress_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a failing delete is never silently swallowed."""
+    fuzz_root, world, run_dir, quarantine_dir = _regression_iteration_paths(stress_root, 9103)
+    for target in (world, run_dir, quarantine_dir):
+        target.mkdir()
+    original_cleanup = stress_conftest.cleanup_owned_direct_child
+
+    def deny_cleanup(*_args, **_kwargs) -> None:
+        raise PermissionError(13, "simulated cleanup denial")
+
+    monkeypatch.setattr(stress_conftest, "cleanup_owned_direct_child", deny_cleanup)
+    with pytest.raises(FixtureCleanupError) as excinfo:
+        _cleanup_iteration(fuzz_root, world, run_dir, quarantine_dir, 42, 9103, ["regression-denied"])
+    error = excinfo.value
+    assert len(error.attempts) == 9
+    assert any("PermissionError" in attempt for attempt in error.attempts)
+    assert any(residual.startswith("FINAL|") for residual in error.residuals)
+    monkeypatch.setattr(stress_conftest, "cleanup_owned_direct_child", original_cleanup)
+    _cleanup_iteration(fuzz_root, world, run_dir, quarantine_dir, 42, 9103, ["regression-cleanup"])
+
+
+@pytest.mark.stress
+def test_fuzz_cleanup_rejects_root_parent_escape_and_link_ancestor(stress_root: Path) -> None:
+    """Regression: validation fails closed before unsafe cleanup is attempted."""
+    fuzz_root, world, _run_dir, _quarantine_dir = _regression_iteration_paths(stress_root, 9104)
+    outside_parent = stress_root / "unit"
+    outside = outside_parent / "fuzz-cleanup-outside"
+    outside.mkdir()
+    link_parent = fuzz_root / "link-parent"
+    try:
+        with pytest.raises(stress_conftest.StressIsolationError):
+            stress_conftest.cleanup_owned_direct_child(fuzz_root, stress_root, stress_root.name)
+        with pytest.raises(stress_conftest.StressIsolationError):
+            stress_conftest.cleanup_owned_direct_child(fuzz_root, outside, outside.name)
+        try:
+            link_parent.symlink_to(outside_parent, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            # The root/parent/escape checks above remain meaningful on Windows
+            # hosts that cannot create developer-mode links.
+            pass
+        else:
+            with pytest.raises(stress_conftest.StressIsolationError):
+                stress_conftest.cleanup_owned_direct_child(
+                    link_parent, link_parent / "child", "child"
+                )
+    finally:
+        if os.path.lexists(os.fspath(link_parent)):
+            stress_conftest.cleanup_owned_direct_child(fuzz_root, link_parent, "link-parent")
+        stress_conftest.cleanup_owned_direct_child(
+            outside_parent, outside, "fuzz-cleanup-outside"
+        )

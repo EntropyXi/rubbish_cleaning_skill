@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import errno
+import json
 import os
+import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -56,6 +59,7 @@ IS_WINDOWS = platform.IS_WINDOWS
 # STRESS_100K_COUNT (e.g. 100000 for a one-off full benchmark, or a smaller
 # value for a fast local/CI run).
 _DEFAULT_FILE_COUNT = 50000
+_CI_FILE_COUNT = 5000
 _FILE_SIZE = 2048  # 2 KiB per file via os.write
 _GEN_BUDGET_SECONDS = 240.0  # abort generation if the machine is too slow
 _SCAN_GATE_SECONDS = 600.0  # scan must finish within 10 minutes
@@ -65,8 +69,69 @@ _DEEP_SCAN_GATE_SECONDS = 360.0  # deep-nesting scan must not hang (Windows CI
                                  # not a hang)
 _CYCLE_SCAN_GATE_SECONDS = 30.0  # symlink-cycle scan must terminate promptly
 
+# The CI L1 envelope is 240 seconds including its own cleanup.  These tighter
+# gates prevent a single test from consuming the 15-minute Actions timeout.
+_CI_GEN_BUDGET_SECONDS = 120.0
+_CI_SCAN_GATE_SECONDS = 90.0
+_CI_DEEP_SCAN_GATE_SECONDS = 90.0
+_CI_DEEP_LEVELS = 250
+
 _OLD_MTIME_DELTA = 8 * 24 * 3600  # 8 days: safely older than the 7-day gate
 _PAD = b"\0" * _FILE_SIZE
+
+
+def _ci_profile_enabled() -> bool:
+    return os.environ.get("STRESS_L2_PROFILE", "").strip().lower() == "ci"
+
+
+def _scan_file_count() -> int:
+    """Use a fixed L1 input in CI; local one-off benchmarks stay configurable."""
+    configured = os.environ.get("STRESS_100K_COUNT")
+    if _ci_profile_enabled():
+        if configured is not None and configured != str(_CI_FILE_COUNT):
+            raise ValueError(
+                f"CI requires STRESS_100K_COUNT={_CI_FILE_COUNT}, got {configured!r}"
+            )
+        return _CI_FILE_COUNT
+    return int(configured or _DEFAULT_FILE_COUNT)
+
+
+def _link_status_path() -> Optional[Path]:
+    raw = os.environ.get("RUBBISH_STRESS_STATUS_FILE")
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.exists() and (path.is_symlink() or not path.is_file()):
+        raise AssertionError(f"link-status path is not a normal file: {path}")
+    if path.parent.is_symlink():
+        raise AssertionError(f"link-status parent is a link: {path.parent}")
+    return path
+
+
+def _write_link_status(status: str, kind: Optional[str], reason: Optional[str]) -> None:
+    """Atomically persist the single CI coverage status schema, when requested."""
+    path = _link_status_path()
+    if path is None:
+        return
+    payload = {
+        "status": status,
+        "kind": kind,
+        "reason": reason,
+        "platform": sys.platform,
+    }
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(info.st_mode) or bool(attributes & reparse)
 
 
 def _write_file(path: Path, size: int = _FILE_SIZE, backdate: bool = True) -> None:
@@ -90,8 +155,13 @@ def _remove_tree(path: Path) -> None:
     An explicit ``os.scandir`` stack stays flat at any depth.
     """
     target = os.fspath(path)
-    if os.path.islink(target):
-        os.unlink(target)
+    if _is_link_or_reparse(path):
+        # os.rmdir removes a directory junction itself; os.unlink removes a
+        # POSIX/directory symlink itself.  Never descend through either.
+        try:
+            os.rmdir(target)
+        except OSError:
+            os.unlink(target)
         return
     if not os.path.exists(target):
         return
@@ -108,8 +178,11 @@ def _remove_tree(path: Path) -> None:
         for entry in entries:
             full = os.path.join(current, entry.name)
             try:
-                if entry.is_symlink():
-                    os.unlink(full)
+                if _is_link_or_reparse(Path(full)):
+                    try:
+                        os.rmdir(full)
+                    except OSError:
+                        os.unlink(full)
                 elif entry.is_dir(follow_symlinks=False):
                     pending.append(full)
                 else:
@@ -170,7 +243,10 @@ def _build_deepest_chain(recycle: Path, levels: int) -> tuple[Path, int]:
 @pytest.mark.stress
 def test_scan_100k_files(stress_root: Path) -> None:
     """Generate a large tree, scan it with the real scanner, record the baseline."""
-    count = int(os.environ.get("STRESS_100K_COUNT", str(_DEFAULT_FILE_COUNT)))
+    count = _scan_file_count()
+    ci = _ci_profile_enabled()
+    generation_budget = _CI_GEN_BUDGET_SECONDS if ci else _GEN_BUDGET_SECONDS
+    scan_budget = _CI_SCAN_GATE_SECONDS if ci else _SCAN_GATE_SECONDS
     workdir = stress_root / "unit" / "scan-100k"
     try:
         temp_dir = workdir / "Temp"
@@ -180,7 +256,7 @@ def test_scan_100k_files(stress_root: Path) -> None:
         for index in range(count):
             if index % 5000 == 0:
                 elapsed = time.monotonic() - start
-                if elapsed > _GEN_BUDGET_SECONDS:
+                if elapsed > generation_budget:
                     raise RuntimeError(
                         "generation too slow on this machine: "
                         f"{elapsed:.0f}s elapsed for {index}/{count} files — "
@@ -188,7 +264,7 @@ def test_scan_100k_files(stress_root: Path) -> None:
                     )
             _write_file(temp_dir / f"f_{index:06d}.tmp")
         gen_elapsed = time.monotonic() - start
-        if gen_elapsed > _GEN_BUDGET_SECONDS:
+        if gen_elapsed > generation_budget:
             raise RuntimeError(
                 "generation too slow on this machine: "
                 f"{gen_elapsed:.0f}s for {count} files — "
@@ -202,8 +278,8 @@ def test_scan_100k_files(stress_root: Path) -> None:
         scan_wall = time.monotonic() - scan_start
         print(f"BASELINE_100K_SCAN_SECONDS={scan_wall:.1f} files={count}")
 
-        assert scan_wall < _SCAN_GATE_SECONDS, (
-            f"100k scan took {scan_wall:.0f}s (gate {_SCAN_GATE_SECONDS}s)"
+        assert scan_wall < scan_budget, (
+            f"100k scan took {scan_wall:.0f}s (gate {scan_budget}s)"
         )
         # Every backdated file in Temp must be a root-temps candidate.
         assert len(result["rows"]) == count, (
@@ -237,8 +313,9 @@ def test_scan_deep_nesting(stress_root: Path) -> None:
         recycle = _recycle_root(workdir)
         recycle.mkdir(parents=True, exist_ok=True)
 
-        deepest, achieved = _build_deepest_chain(recycle, 1000)
-        print(f"DEEP_ACHIEVED_DEPTH={achieved}")
+        requested_levels = _CI_DEEP_LEVELS if _ci_profile_enabled() else 1000
+        deepest, achieved = _build_deepest_chain(recycle, requested_levels)
+        print(f"DEEP_ACHIEVED_DEPTH={achieved} requested={requested_levels}")
         assert achieved >= 40, (
             f"deep chain only reached depth {achieved} — the OS limit is far "
             "too low on this host for the test to be meaningful"
@@ -251,7 +328,8 @@ def test_scan_deep_nesting(stress_root: Path) -> None:
             extra["home_dir"] = os.fspath(workdir)
         result = _scan(workdir, ["recycle-bin"], workdir / "out", **extra)
         elapsed = time.monotonic() - start
-        assert elapsed < _DEEP_SCAN_GATE_SECONDS, (
+        deep_budget = _CI_DEEP_SCAN_GATE_SECONDS if _ci_profile_enabled() else _DEEP_SCAN_GATE_SECONDS
+        assert elapsed < deep_budget, (
             f"deep-nesting scan took {elapsed:.0f}s — looks like a hang"
         )
         # Robustness: the scan terminated without exception and returned a
@@ -288,8 +366,19 @@ def test_scan_long_paths(stress_root: Path) -> None:
                 long_file = candidate
                 break
             assert long_file is not None, "OS rejected even a 100-char filename"
-            # A long-named directory entry also exercises os.scandir.
-            (temp_dir / ("d" * 150)).mkdir(exist_ok=True)
+            # A long-named directory entry also exercises os.scandir.  The
+            # fail-closed session root intentionally adds path components, so
+            # adapt this *separate* directory component to the legacy Win32
+            # path budget just as we do for the file component above.
+            long_dir_created = False
+            for name_len in (150, 130, 110, 90, 70, 50, 30, 20):
+                try:
+                    (temp_dir / ("d" * name_len)).mkdir(exist_ok=True)
+                except OSError:
+                    continue
+                long_dir_created = True
+                break
+            assert long_dir_created, "OS rejected every long directory component"
             extra: dict = {}
         else:
             # POSIX: nested 200-char dirs push the TOTAL path to ~1050 chars
@@ -392,24 +481,47 @@ def test_clean_concurrent_drives(stress_root: Path) -> None:
 def test_broken_symlink_cycle(stress_root: Path) -> None:
     """A symlink cycle (a->b->a) must not make the scanner loop forever."""
     workdir = stress_root / "unit" / "symlink-cycle"
+    require_windows = os.environ.get("REQUIRE_WINDOWS_LINK_CYCLE") == "1"
+    require_posix = os.environ.get("REQUIRE_POSIX_LINK_CYCLE") == "1"
+    required = require_windows if IS_WINDOWS else require_posix
+    status = "failed"
+    kind: Optional[str] = None
+    reason: Optional[str] = None
     try:
         recycle = _recycle_root(workdir)
         recycle.mkdir(parents=True, exist_ok=True)
         loop = recycle / "loop"
         loop.mkdir(exist_ok=True)
-
         try:
-            (loop / "a").symlink_to("b", target_is_directory=True)
-            (loop / "b").symlink_to("a", target_is_directory=True)
+            if IS_WINDOWS:
+                # Prefer a true junction on Windows.  It requires no developer
+                # mode on hosted runners and points back into this owned leaf.
+                created = subprocess.run(
+                    ["cmd", "/d", "/c", "mklink", "/J", os.fspath(loop / "a"), os.fspath(loop)],
+                    capture_output=True, text=True, check=False,
+                )
+                if created.returncode == 0 and _is_link_or_reparse(loop / "a"):
+                    kind = "junction"
+                else:
+                    # Some Windows filesystems reject junctions; directory
+                    # symlink is the documented fallback when developer mode
+                    # or elevated privilege is available.
+                    (loop / "a").symlink_to(".", target_is_directory=True)
+                    kind = "symlink"
+            else:
+                (loop / "a").symlink_to(".", target_is_directory=True)
+                kind = "symlink"
         except (OSError, NotImplementedError) as error:
-            pytest.skip(
-                "cannot create a symlink/junction cycle on this host: "
-                f"{error} (Windows requires admin or developer mode)"
-            )
+            reason = f"cannot create a symlink/junction cycle: {type(error).__name__}: {error}"
+            status = "skipped"
+            _write_link_status(status, kind, reason)
+            if required:
+                pytest.fail(reason)
+            pytest.skip(reason)
 
         # A real file at the top level so the walk has a genuine candidate.
         _write_file(recycle / "real.tmp", size=128)
-        print("SYMLINK_CYCLE_CREATED=True")
+        print(f"SYMLINK_CYCLE_CREATED=True kind={kind}")
 
         start = time.monotonic()
         # is_user_drive=True: recycle-bin is a POSIX user category, so with
@@ -427,7 +539,9 @@ def test_broken_symlink_cycle(stress_root: Path) -> None:
         # itself; the loop's symlinks contributed nothing.
         assert len(result["rows"]) == 1, result["rows"]
         assert result["rows"][0]["Category"] == "recycle-bin"
+        status = "executed"
     finally:
+        _write_link_status(status, kind, reason)
         _remove_tree(workdir)
 
 
