@@ -74,6 +74,7 @@ _CYCLE_SCAN_GATE_SECONDS = 30.0  # symlink-cycle scan must terminate promptly
 _CI_GEN_BUDGET_SECONDS = 120.0
 _CI_SCAN_GATE_SECONDS = 90.0
 _CI_DEEP_SCAN_GATE_SECONDS = 90.0
+_CI_DEEP_LEVELS = 250
 
 _OLD_MTIME_DELTA = 8 * 24 * 3600  # 8 days: safely older than the 7-day gate
 _PAD = b"\0" * _FILE_SIZE
@@ -312,8 +313,9 @@ def test_scan_deep_nesting(stress_root: Path) -> None:
         recycle = _recycle_root(workdir)
         recycle.mkdir(parents=True, exist_ok=True)
 
-        deepest, achieved = _build_deepest_chain(recycle, 1000)
-        print(f"DEEP_ACHIEVED_DEPTH={achieved}")
+        requested_levels = _CI_DEEP_LEVELS if _ci_profile_enabled() else 1000
+        deepest, achieved = _build_deepest_chain(recycle, requested_levels)
+        print(f"DEEP_ACHIEVED_DEPTH={achieved} requested={requested_levels}")
         assert achieved >= 40, (
             f"deep chain only reached depth {achieved} — the OS limit is far "
             "too low on this host for the test to be meaningful"
